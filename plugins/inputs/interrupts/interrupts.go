@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/plugins/inputs"
-	"io/ioutil"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -38,18 +38,21 @@ func (s *Interrupts) SampleConfig() string {
 	return sampleConfig
 }
 
-func parseInterrupts(irqdata string) ([]IRQ, error) {
+func parseInterrupts(irqfile string) ([]IRQ, error) {
 	var irqs []IRQ
 	var cpucount int
-	scanner := bufio.NewScanner(strings.NewReader(irqdata))
-	ok := scanner.Scan()
-	if ok {
+	f, err := os.Open(irqfile)
+	if err != nil {
+		return nil, fmt.Errorf("Could not open file: %s", irqfile)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	if scanner.Scan() {
 		cpus := strings.Fields(scanner.Text())
-		if cpus[0] == "CPU0" {
-			cpucount = len(cpus)
+		if cpus[0] != "CPU0" {
+			return nil, fmt.Errorf("Expected first line to start with CPU0, but was %s", scanner.Text())
 		}
-	} else if scanner.Err() != nil {
-		return irqs, fmt.Errorf("Reading %s: %s", scanner.Text(), scanner.Err())
+		cpucount = len(cpus)
 	}
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -80,46 +83,33 @@ func parseInterrupts(irqdata string) ([]IRQ, error) {
 		}
 		irqs = append(irqs, *irq)
 	}
+	if scanner.Err() != nil {
+		return nil, fmt.Errorf("Error scanning file: %s", scanner.Err())
+	}
 	return irqs, nil
 }
 
-func (s *Interrupts) Gather(acc telegraf.Accumulator) error {
-	data, err := ioutil.ReadFile("/proc/interrupts")
-	if err != nil {
-		acc.AddError(fmt.Errorf("Reading %s: %s", "/proc/interrupts", err))
+func gatherTagsFields(irq IRQ) (map[string]string, map[string]interface{}) {
+	tags := map[string]string{"irq": irq.ID, "type": irq.Type, "device": irq.Device}
+	fields := map[string]interface{}{"total": irq.Total}
+	for i := 0; i < len(irq.Cpus); i++ {
+		cpu := fmt.Sprintf("CPU%d", i)
+		fields[cpu] = irq.Cpus[i]
 	}
-	irqdata := string(data)
-	irqs, err := parseInterrupts(irqdata)
-	if err != nil {
-		acc.AddError(fmt.Errorf("Parsing %s: %s", "/proc/interrupts", err))
-	}
-	for _, irq := range irqs {
-		tags := map[string]string{"irq": irq.ID, "type": irq.Type, "device": irq.Device}
-		fields := map[string]interface{}{"total": irq.Total}
-		for i := 0; i < len(irq.Cpus); i++ {
-			cpu := fmt.Sprintf("CPU%d", i)
-			fields[cpu] = irq.Cpus[i]
-		}
-		acc.AddFields("interrupts", fields, tags)
-	}
+	return tags, fields
+}
 
-	data, err = ioutil.ReadFile("/proc/softirqs")
-	if err != nil {
-		acc.AddError(fmt.Errorf("Reading %s: %s", "/proc/softirqs", err))
-	}
-	irqdata = string(data)
-	irqs, err = parseInterrupts(irqdata)
-	if err != nil {
-		acc.AddError(fmt.Errorf("Parsing %s: %s", "/proc/softirqs", err))
-	}
-	for _, irq := range irqs {
-		tags := map[string]string{"irq": irq.ID, "type": irq.Type, "device": irq.Device}
-		fields := map[string]interface{}{"total": irq.Total}
-		for i := 0; i < len(irq.Cpus); i++ {
-			cpu := fmt.Sprintf("CPU%d", i)
-			fields[cpu] = irq.Cpus[i]
+func (s *Interrupts) Gather(acc telegraf.Accumulator) error {
+	for key, file := range map[string]string{"interrupts": "/proc/interrupts", "soft_interrupts": "/proc/softirqs"} {
+		irqs, err := parseInterrupts(file)
+		if err != nil {
+			acc.AddError(fmt.Errorf("Parsing %s: %s", file, err))
+			continue
 		}
-		acc.AddFields("soft_interrupts", fields, tags)
+		for _, irq := range irqs {
+			tags, fields := gatherTagsFields(irq)
+			acc.AddFields(key, fields, tags)
+		}
 	}
 	return nil
 }
